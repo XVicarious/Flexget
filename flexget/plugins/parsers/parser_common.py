@@ -104,7 +104,7 @@ def normalize_name(name):
     try:
         name = capwords(name)
     except AttributeError:
-        raise plugin.PluginError('The passed "name" was None')
+        raise plugin.PluginWarning('The passed "name" was None')
     return name
 
 
