@@ -5,6 +5,7 @@ import logging
 import re
 from string import capwords
 
+from flexget import plugin
 from flexget.utils.qualities import Quality
 
 log = logging.getLogger('parser')
@@ -100,7 +101,10 @@ def remove_dirt(name):
 
 
 def normalize_name(name):
-    name = capwords(name)
+    try:
+        name = capwords(name)
+    except AttributeError:
+        raise plugin.PluginError('The passed "name" was None')
     return name
 
 
