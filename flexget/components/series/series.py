@@ -334,13 +334,13 @@ class FilterSeriesBase(object):
         )
         return task.config['series']
 
-@pysnooper.snoop('do_job.'+str(current_process().pid)+'.log')
+@pysnooper.snoop('do_job.'+str(int(round(time.time() * 1000)))+'.log')
 def do_job(entry_queue: Queue, done_queue: Queue, d):
     psutil.Process().cpu_affinity(d)
     parser = plugin.get('parsing', {'plugin_info': {'name': 'series'}})
     while True:
         try:
-            idx_entry, task = entry_queue.get(timeout=1)
+            idx_entry, task = entry_queue.get(timeout=5)
         except queue.Empty:
             break
         else:
@@ -352,17 +352,18 @@ def do_job(entry_queue: Queue, done_queue: Queue, d):
                 # If parsing failed, use first char of each word in the entry title
                 for word in task.replace(' ', '.').split('.'):
                     word_keys.append(word[:1].lower())
-            done_queue.put([idx_entry, task, word_keys])
-            if entry_queue.qsize() % 25 == 0:
+            done_queue.put([idx_entry, word_keys])
+            if entry_queue.qsize() % 10 == 0:
                 log.verbose('Items left to parse: %s', entry_queue.qsize())
     return True
 
+@pysnooper.snoop('do_job_2.'+str(int(round(time.time() * 1000)))+'.log', depth=2)
 def do_job_2(entry_queue: Queue, done_queue: Queue, affinity):
     psutil.Process().cpu_affinity(affinity)
     parser = plugin.get('parsing', {'plugin_info': {'name': 'series'}})
     while True:
         try:
-            title, series_name, params = entry_queue.get(timeout=1)
+            title, series_name, params = entry_queue.get(timeout=5)
         except queue.Empty:
             break
         else:
@@ -372,6 +373,8 @@ def do_job_2(entry_queue: Queue, done_queue: Queue, affinity):
             parsed.field = 'title'
             log.debug('`%s` detected as `%s`, field: `%s`', title, parsed, parsed.field)
             done_queue.put([title, parsed])
+            if entry_queue.qsize() % 10 == 0:
+                log.verbose('Items left to parse: %s', entry_queue.qsize())
     return True
 
 
@@ -457,31 +460,20 @@ class FilterSeries(FilterSeriesBase):
         for proc in range(n_cpus):
             tmp_proc = Process(target=do_job, args=(entry_queue, done_queue, [proc]))
             processes.append(tmp_proc)
+            time.sleep(0.1)
             tmp_proc.start()
         log.info('started procs')
-        time.sleep(2)
         while not entry_queue.empty() or not done_queue.empty():
-            try:
-                idx_entry, keywords = done_queue.get(timeout=10)
-            except queue.Empty:
-                break
-            else:
-                if done_queue.qsize() % 25 == 0:
-                    log.info('done queue: %s', done_queue.qsize())
-                o_ety = entries[idx_entry]
-                if o_ety:
-                    [entries_map[keyword].append(o_ety) for keyword in keywords]
-        log.info('queue empty')
+            idx_entry, keywords = done_queue.get()
+            o_ety = entries[idx_entry]
+            if o_ety:
+                [entries_map[keyword].append(o_ety) for keyword in keywords]
+            current_size = done_queue.qsize()
+            if current_size % 10 == 0:
+                log.info('done queue: %s', current_size)
+        log.debug('series on_task_metainfo took %s to parse', preferred_clock() - start_time)
         for proc in processes:
             proc.join()
-        log.info('joined procs')
-        #for entry, parsed in parsed2:
-        #    if parsed.name:
-        #        entries_map[parsed.name[:1].lower()].append(entry)
-        #    else:
-        #        # If parsing failed, use first char of each word in the entry title
-        #        for word in entry['title'].replace(' ', '.').split('.'):
-        #            entries_map[word[:1].lower()].append(entry)
 
         with Session() as session:
             # Preload series
@@ -626,6 +618,13 @@ class FilterSeries(FilterSeriesBase):
 
         log.debug('processing series took %s', preferred_clock() - start_time)
 
+    def entry_valid(self, entry, series_name):
+        return (
+            entry.get('series_parser')
+            and entry['series_parser'].valid
+            and entry['series_parser'].name.lower() != series_name.lower()
+        )
+
     @pysnooper.snoop('parse_series.log')
     def parse_series(self, entries, series_name, config, db_identified_by=None):
         """
@@ -663,43 +662,23 @@ class FilterSeries(FilterSeriesBase):
         done_queue = Queue()
         n_cpus = psutil.cpu_count()
         processes = []
-        #for entry in entries:
-            # skip processed entries
-        #    if (
-        #        entry.get('series_parser')
-        #        and entry['series_parser'].valid
-        #        and entry['series_parser'].name.lower() != series_name.lower()
-        #    ):
-        #        continue
-
-            # Quality field may have been manipulated by e.g. assume_quality. Use quality field from entry if available.
-            #parsed = parser.parse_series(entry['title'], name=series_name, **params)
-            #if not parsed.valid:
-            #    continue
-            #parsed.field = 'title'
-
-            #log.debug('`%s` detected as `%s`, field: `%s`', entry['title'], parsed, parsed.field)
-            #populate_entry_fields(entry, parsed, config)
-
+        [entry_queue.put([entry['title'], series_name, params]) for entry in entries if not self.entry_valid(entry, series_name)]
+        log.verbose('Items in entry queue: %s', entry_queue.qsize())
         for proc in range(n_cpus):
             tmp_proc = Process(target=do_job_2, args=(entry_queue, done_queue, [proc]))
             processes.append(tmp_proc)
             tmp_proc.start()
-        def entry_valid(entry):
-            return (
-                entry.get('series_parser')
-                and entry['series_parser'].valid
-                and entry['series_parser'].name.lower() != series_name.lower()
-            )
-        [entry_queue.put([entry['title'], series_name, params]) for entry in entries if not entry_valid(entry)]
+        while done_queue.qsize() or entry_queue.qsize():
+            log.verbose('%s/%s', entry_queue.qsize(), done_queue.qsize())
+            title, parsed = done_queue.get()
+            for entry in entries:
+                if not self.entry_valid(entry, series_name) and title == entry['title']:
+                    populate_entry_fields(entry, parsed, config)
+            current_size = done_queue.qsize()
+            if current_size % 10 == 0:
+                log.verbose('Entries left to propagate: %s', current_size)
         for proc in processes:
             proc.join()
-
-        while done_queue.qsize():
-            title, parsed = done_queue.get_nowait()
-            for entry in entries:
-                if not entry_valid(entry) and title == entry['title']:
-                    populate_entry_fields(entry, parsed, config)
 
     def process_series(self, task, series_entries, config):
         """
