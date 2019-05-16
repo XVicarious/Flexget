@@ -6,7 +6,7 @@ import logging
 import sys
 import time
 from builtins import *  # noqa pylint: disable=unused-import, redefined-builtin
-from collections import defaultdict, ChainMap
+from collections import defaultdict
 from copy import copy
 from datetime import datetime
 
@@ -357,26 +357,6 @@ def do_job(entry_queue: Queue, done_queue: Queue, d):
                 log.verbose('Items left to parse: %s', entry_queue.qsize())
     return True
 
-@pysnooper.snoop('do_job_2.'+str(int(round(time.time() * 1000)))+'.log', depth=2)
-def do_job_2(entry_queue: Queue, done_queue: Queue, affinity):
-    psutil.Process().cpu_affinity(affinity)
-    parser = plugin.get('parsing', {'plugin_info': {'name': 'series'}})
-    while True:
-        try:
-            title, series_name, params = entry_queue.get(timeout=5)
-        except queue.Empty:
-            break
-        else:
-            parsed = parser.parse_series(title, name=series_name, **params)
-            if not parsed.valid:
-                continue
-            parsed.field = 'title'
-            log.debug('`%s` detected as `%s`, field: `%s`', title, parsed, parsed.field)
-            done_queue.put([title, parsed])
-            if entry_queue.qsize() % 10 == 0:
-                log.verbose('Items left to parse: %s', entry_queue.qsize())
-    return True
-
 
 class FilterSeries(FilterSeriesBase):
     """
@@ -435,14 +415,13 @@ class FilterSeries(FilterSeriesBase):
                             name,
                         )
                         series_config['exact'] = True
+
     # Run after metainfo_quality and before metainfo_series
     @plugin.priority(125)
     @pysnooper.snoop('on_task_metainfo.series.log')
     def on_task_metainfo(self, task, config):
         config = self.prepare_config(config)
         self.auto_exact(config)
-
-        parser = plugin.get('parsing', self)
 
         start_time = preferred_clock()
 
@@ -618,14 +597,6 @@ class FilterSeries(FilterSeriesBase):
 
         log.debug('processing series took %s', preferred_clock() - start_time)
 
-    def entry_valid(self, entry, series_name):
-        return (
-            entry.get('series_parser')
-            and entry['series_parser'].valid
-            and entry['series_parser'].name.lower() != series_name.lower()
-        )
-
-    @pysnooper.snoop('parse_series.log')
     def parse_series(self, entries, series_name, config, db_identified_by=None):
         """
         Search for `series_name` and populate all `series_*` fields in entries when successfully parsed
@@ -658,27 +629,23 @@ class FilterSeries(FilterSeriesBase):
             params[id_type + '_regexps'] = get_config_as_array(config, id_type + '_regexp')
 
         parser = plugin.get('parsing', self)
-        entry_queue = Queue()
-        done_queue = Queue()
-        n_cpus = psutil.cpu_count()
-        processes = []
-        [entry_queue.put([entry['title'], series_name, params]) for entry in entries if not self.entry_valid(entry, series_name)]
-        log.verbose('Items in entry queue: %s', entry_queue.qsize())
-        for proc in range(n_cpus):
-            tmp_proc = Process(target=do_job_2, args=(entry_queue, done_queue, [proc]))
-            processes.append(tmp_proc)
-            tmp_proc.start()
-        while done_queue.qsize() or entry_queue.qsize():
-            log.verbose('%s/%s', entry_queue.qsize(), done_queue.qsize())
-            title, parsed = done_queue.get()
-            for entry in entries:
-                if not self.entry_valid(entry, series_name) and title == entry['title']:
-                    populate_entry_fields(entry, parsed, config)
-            current_size = done_queue.qsize()
-            if current_size % 10 == 0:
-                log.verbose('Entries left to propagate: %s', current_size)
-        for proc in processes:
-            proc.join()
+        for entry in entries:
+            # skip processed entries
+            if (
+                entry.get('series_parser')
+                and entry['series_parser'].valid
+                and entry['series_parser'].name.lower() != series_name.lower()
+            ):
+                continue
+
+            # Quality field may have been manipulated by e.g. assume_quality. Use quality field from entry if available.
+            parsed = parser.parse_series(entry['title'], name=series_name, **params)
+            if not parsed.valid:
+                continue
+            parsed.field = 'title'
+
+            log.debug('`%s` detected as `%s`, field: `%s`', entry['title'], parsed, parsed.field)
+            populate_entry_fields(entry, parsed, config)
 
     def process_series(self, task, series_entries, config):
         """
