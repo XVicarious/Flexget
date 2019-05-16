@@ -6,7 +6,7 @@ import logging
 import sys
 import time
 from builtins import *  # noqa pylint: disable=unused-import, redefined-builtin
-from collections import defaultdict
+from collections import defaultdict, ChainMap
 from copy import copy
 from datetime import datetime
 
@@ -23,7 +23,10 @@ from flexget.utils import qualities
 from flexget.utils.log import log_once
 from flexget.utils.tools import parse_timedelta, get_config_as_array, chunked, merge_dict_from_to
 from . import db
-
+import queue
+from multiprocessing import Process, Queue, current_process, Pipe
+import psutil
+import pysnooper
 try:
     # NOTE: Importing other plugins is discouraged!
     from flexget.components.parsing.parsers import parser_common as plugin_parser_common
@@ -331,6 +334,46 @@ class FilterSeriesBase(object):
         )
         return task.config['series']
 
+@pysnooper.snoop('do_job.'+str(current_process().pid)+'.log')
+def do_job(entry_queue: Queue, done_queue: Queue, d):
+    psutil.Process().cpu_affinity(d)
+    parser = plugin.get('parsing', {'plugin_info': {'name': 'series'}})
+    while True:
+        try:
+            idx_entry, task = entry_queue.get(timeout=1)
+        except queue.Empty:
+            break
+        else:
+            parsed = parser.parse_series(task)
+            word_keys = []
+            if parsed.name:
+                word_keys.append(parsed.name[:1].lower())
+            else:
+                # If parsing failed, use first char of each word in the entry title
+                for word in task.replace(' ', '.').split('.'):
+                    word_keys.append(word[:1].lower())
+            done_queue.put([idx_entry, task, word_keys])
+            if entry_queue.qsize() % 25 == 0:
+                log.verbose('Items left to parse: %s', entry_queue.qsize())
+    return True
+
+def do_job_2(entry_queue: Queue, done_queue: Queue, affinity):
+    psutil.Process().cpu_affinity(affinity)
+    parser = plugin.get('parsing', {'plugin_info': {'name': 'series'}})
+    while True:
+        try:
+            title, series_name, params = entry_queue.get(timeout=1)
+        except queue.Empty:
+            break
+        else:
+            parsed = parser.parse_series(title, name=series_name, **params)
+            if not parsed.valid:
+                continue
+            parsed.field = 'title'
+            log.debug('`%s` detected as `%s`, field: `%s`', title, parsed, parsed.field)
+            done_queue.put([title, parsed])
+    return True
+
 
 class FilterSeries(FilterSeriesBase):
     """
@@ -389,9 +432,9 @@ class FilterSeries(FilterSeriesBase):
                             name,
                         )
                         series_config['exact'] = True
-
     # Run after metainfo_quality and before metainfo_series
     @plugin.priority(125)
+    @pysnooper.snoop('on_task_metainfo.series.log')
     def on_task_metainfo(self, task, config):
         config = self.prepare_config(config)
         self.auto_exact(config)
@@ -403,14 +446,42 @@ class FilterSeries(FilterSeriesBase):
         # Sort Entries into data model similar to https://en.wikipedia.org/wiki/Trie
         # Only process series if both the entry title and series title first letter match
         entries_map = defaultdict(list)
-        for entry in task.entries:
-            parsed = parser.parse_series(entry['title'])
-            if parsed.name:
-                entries_map[parsed.name[:1].lower()].append(entry)
+        entry_queue = Queue()
+        done_queue = Queue()
+        n_cpus = psutil.cpu_count()
+        processes = []
+        log.info('putting %s entries in a queue', len(task.entries))
+        entries = list(task.entries)
+        [entry_queue.put([entries.index(entry), entry['title']]) for entry in entries]
+        log.info('entries now in queue')
+        for proc in range(n_cpus):
+            tmp_proc = Process(target=do_job, args=(entry_queue, done_queue, [proc]))
+            processes.append(tmp_proc)
+            tmp_proc.start()
+        log.info('started procs')
+        time.sleep(2)
+        while not entry_queue.empty() or not done_queue.empty():
+            try:
+                idx_entry, keywords = done_queue.get(timeout=10)
+            except queue.Empty:
+                break
             else:
-                # If parsing failed, use first char of each word in the entry title
-                for word in entry['title'].replace(' ', '.').split('.'):
-                    entries_map[word[:1].lower()].append(entry)
+                if done_queue.qsize() % 25 == 0:
+                    log.info('done queue: %s', done_queue.qsize())
+                o_ety = entries[idx_entry]
+                if o_ety:
+                    [entries_map[keyword].append(o_ety) for keyword in keywords]
+        log.info('queue empty')
+        for proc in processes:
+            proc.join()
+        log.info('joined procs')
+        #for entry, parsed in parsed2:
+        #    if parsed.name:
+        #        entries_map[parsed.name[:1].lower()].append(entry)
+        #    else:
+        #        # If parsing failed, use first char of each word in the entry title
+        #        for word in entry['title'].replace(' ', '.').split('.'):
+        #            entries_map[word[:1].lower()].append(entry)
 
         with Session() as session:
             # Preload series
@@ -555,6 +626,7 @@ class FilterSeries(FilterSeriesBase):
 
         log.debug('processing series took %s', preferred_clock() - start_time)
 
+    @pysnooper.snoop('parse_series.log')
     def parse_series(self, entries, series_name, config, db_identified_by=None):
         """
         Search for `series_name` and populate all `series_*` fields in entries when successfully parsed
@@ -587,23 +659,47 @@ class FilterSeries(FilterSeriesBase):
             params[id_type + '_regexps'] = get_config_as_array(config, id_type + '_regexp')
 
         parser = plugin.get('parsing', self)
-        for entry in entries:
+        entry_queue = Queue()
+        done_queue = Queue()
+        n_cpus = psutil.cpu_count()
+        processes = []
+        #for entry in entries:
             # skip processed entries
-            if (
+        #    if (
+        #        entry.get('series_parser')
+        #        and entry['series_parser'].valid
+        #        and entry['series_parser'].name.lower() != series_name.lower()
+        #    ):
+        #        continue
+
+            # Quality field may have been manipulated by e.g. assume_quality. Use quality field from entry if available.
+            #parsed = parser.parse_series(entry['title'], name=series_name, **params)
+            #if not parsed.valid:
+            #    continue
+            #parsed.field = 'title'
+
+            #log.debug('`%s` detected as `%s`, field: `%s`', entry['title'], parsed, parsed.field)
+            #populate_entry_fields(entry, parsed, config)
+
+        for proc in range(n_cpus):
+            tmp_proc = Process(target=do_job_2, args=(entry_queue, done_queue, [proc]))
+            processes.append(tmp_proc)
+            tmp_proc.start()
+        def entry_valid(entry):
+            return (
                 entry.get('series_parser')
                 and entry['series_parser'].valid
                 and entry['series_parser'].name.lower() != series_name.lower()
-            ):
-                continue
+            )
+        [entry_queue.put([entry['title'], series_name, params]) for entry in entries if not entry_valid(entry)]
+        for proc in processes:
+            proc.join()
 
-            # Quality field may have been manipulated by e.g. assume_quality. Use quality field from entry if available.
-            parsed = parser.parse_series(entry['title'], name=series_name, **params)
-            if not parsed.valid:
-                continue
-            parsed.field = 'title'
-
-            log.debug('`%s` detected as `%s`, field: `%s`', entry['title'], parsed, parsed.field)
-            populate_entry_fields(entry, parsed, config)
+        while done_queue.qsize():
+            title, parsed = done_queue.get_nowait()
+            for entry in entries:
+                if not entry_valid(entry) and title == entry['title']:
+                    populate_entry_fields(entry, parsed, config)
 
     def process_series(self, task, series_entries, config):
         """
